@@ -1,3 +1,4 @@
+#!/bin/sh
 # This script runs TIMEVIEW model on datasets Sine, Beta, Tumour and Tacrolimus
 # This data is needed for Figure 1, Figure 4, Figure 7, Figure 8, Figure 9, Figure 10, Figure 15
 

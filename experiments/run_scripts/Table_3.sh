@@ -1,3 +1,4 @@
+#!/bin/sh
 # Get the argument --debug to run the experiments in debug mode. This will run the experiments with a smaller number of trials and tune iterations.
 # Example: bash Table_3.sh --debug
 

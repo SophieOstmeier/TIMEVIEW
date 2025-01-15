@@ -142,3 +142,11 @@ results/
 hall_of_fame_*
 
 scratchpad/
+
+**slurm**
+**.jolib**
+**gp_model**
+**preprocess**
+**events**
+**png**
+**json**
