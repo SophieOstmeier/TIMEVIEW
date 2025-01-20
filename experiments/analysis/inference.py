@@ -3,18 +3,11 @@
 import matplotlib.pyplot as plt
 import sys
 import np
+import ipdb
 
 sys.path.append("../../")
-from timeview.visualize import expert_tts_plot, grid_tts_plot
-from experiments.datasets import load_dataset
-from experiments.benchmark import (
-    load_column_transformer,
-    create_benchmark_datasets_if_not_exist,
-)
-from timeview.lit_module import load_model
-from experiments.baselines import YNormalizer
-from experiments.analysis.analysis_utils import find_results
 from experiments.benchmark import generate_indices
+from lipschitz import estimate_lipschitz_constant
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -25,147 +18,119 @@ import pandas as pd
 from timeview.basis import BSplineBasis
 import os
 import json
-
-
-def get_splits_from_summary(timestamp, results_dir, summary_filename):
-    # Load summary file
-    with open(os.path.join(results_dir, summary_filename), "r") as summary_file:
-        summary = json.load(summary_file)
-
-    # Find the entry matching the timestamp
-    for result in summary:
-        if result["timestamp"] == timestamp:
-            train_size = result["train_size"]
-            val_size = result["val_size"]
-            test_size = 1 - train_size - val_size
-            seed = result["seed"]
-
-            return [train_size, val_size, test_size], seed
-
-    raise ValueError(f"No entry found for timestamp {timestamp} in summary file")
+from experiments.datasets import load_dataset
+from experiments.benchmark import (
+    load_column_transformer,
+    create_benchmark_datasets_if_not_exist,
+)
+from timeview.lit_module import load_model
+from experiments.baselines import YNormalizer
+from experiments.analysis.analysis_utils import find_results
+import os
+import json
+import datetime
+from experiments.analysis.inference_construct_grid import (
+    get_feature_combinations_l2,
+    get_feature_combinations,
+)
+from experiments.analysis.inference_utils import get_splits_from_summary
 
 
 def evaluate_model_predictions(
-    settings,
     dataset,
     feature_types,
     feature_ranges,
     trajectories,
     time_points,
+    feature_combinations,
+    constant_features,
+    result_dir,
     train_size=0.7,
     val_size=0.15,
     seed=0,
-    gamma=0.05,
-    n_perturbations=100,
 ):
-    """
-    Evaluate model predictions using multiple metrics.
-    """
+
+    # Find minimum for each trajectory
+    min_per_trajectory = [
+        (i, np.argmin(traj), np.min(traj)) for i, traj in enumerate(trajectories)
+    ]
+
+    # Find the overall minimum
+    best_traj_idx, best_time_idx, best_value = min(
+        min_per_trajectory, key=lambda x: x[2]
+    )
+    # Get the best setting
+    best_setting = feature_combinations[best_traj_idx]
+
+    # Create a results dictionary
+    summary_dict = {
+        "best_decline": {
+            "value": float(best_value),
+            "index": float(best_traj_idx),
+            "time_index": float(best_time_idx),
+        },
+        "constant_features": {key: value for key, value in constant_features.items()},
+        "best_varying_features": {},
+    }
+
+    # Add varying features with their values and ranges
+    for key, value in best_setting.items():
+        if key not in constant_features:
+            feature_info = {"value": value, "type": feature_types[key]}
+
+            if feature_types[key] == "continuous":
+                feature_info["range"] = {
+                    "min": feature_ranges[key][0],
+                    "max": feature_ranges[key][1],
+                }
+            else:  # categorical or binary
+                feature_info["possible_values"] = feature_ranges[key]
+
+            summary_dict["best_varying_features"][key] = feature_info
+    plt.figure(figsize=(12, 8))
+    # Plot all trajectories in light gray
+    for trajectory in trajectories:
+        plt.plot(time_points, trajectory, alpha=0.1, color="gray")
+    # Plot the best trajectory in blue
+    plt.plot(
+        time_points,
+        trajectories[best_traj_idx],
+        "b-",
+        linewidth=2,
+        label="Least decline",
+    )
+    plt.xlabel("Time")
+    plt.ylabel("Value")
+    plt.title(
+        f"Trajectories with {constant_features} \n(n={len(feature_combinations)})"
+    )
+    plt.legend()
+    plt.grid(True)
+
+    # Save the figure
+    filename = f"{result_dir}/trajectories{constant_features}.png"
+    plt.savefig(filename, dpi=300, bbox_inches="tight")
+    plt.close()
+
+    print(f"\nFigure saved as: {filename}")
     # Generate train/val/test splits
     _, _, test_indices = generate_indices(len(dataset), train_size, val_size, seed)
 
-    # Get test data features and trajectories from dataset
-    test_features = dataset.X.iloc[test_indices]
-    test_trajectories = [dataset.ys[i] for i in test_indices]
+    # Calculate metrics for best settings trajectory
+    min_y = np.min(trajectories[best_traj_idx])
+    avg_y = np.mean(trajectories[best_traj_idx])
+    decline = trajectories[best_traj_idx][-1] - trajectories[best_traj_idx][0]
 
-    def normalize_features(features):
-        """Normalize features to [0,1] range for distance calculation"""
-        normalized = {}
-        for feature, value in features.items():
-            if feature_types[feature] == "continuous":
-                min_val, max_val = feature_ranges[feature]
-                normalized[feature] = (value - min_val) / (max_val - min_val)
-            else:
-                # For categorical features, use one-hot encoding
-                possible_values = feature_ranges[feature]
-                normalized[feature] = 1 if value in possible_values else 0
-        return normalized
-
-    def euclidean_distance(features1, features2):
-        """Calculate normalized Euclidean distance between feature sets"""
-        norm1 = normalize_features(features1)
-        norm2 = normalize_features(features2)
-
-        squared_diff_sum = 0
-        for feature in norm1:
-            squared_diff_sum += (norm1[feature] - norm2[feature]) ** 2
-
-        return np.sqrt(squared_diff_sum)
-
-    # Calculate declines for each trajectory
-    declines = trajectories[:, -1] - trajectories[:, 0]  # End point minus start point
-
-    # Find trajectory with least decline (most negative change)
-    best_idx = np.argmin(declines)
-    best_setting = settings[best_idx]
-
-    # Find closest matching example in test data
-    min_distance = float("inf")
-    closest_example = None
-    closest_idx = None
-
-    # Convert test_features rows to dictionaries and find closest example
-    for i, feature_row in test_features.iterrows():
-        feature_dict = feature_row.to_dict()
-        distance = euclidean_distance(best_setting, feature_dict)
-
-        if distance < min_distance:
-            min_distance = distance
-            closest_example = feature_dict
-            closest_idx = i
-
-    # Calculate metrics
-    # 1. Prediction Error - using decline (end - start)
-    predicted_decline = trajectories[best_idx][-1] - trajectories[best_idx][0]
-
-    # Get actual trajectory for closest example
-    actual_trajectory = dataset.ys[closest_idx]
-    actual_decline = actual_trajectory[-1] - actual_trajectory[0]
-
-    E_pred = np.abs(predicted_decline - actual_decline)
-
-    # 2. Relative Improvement - using average decline across test set
-    test_declines = [traj[-1] - traj[0] for traj in test_trajectories]
-    avg_test_decline = np.mean(test_declines)
-
-    R_imp = ((actual_decline - avg_test_decline) / avg_test_decline) * 100
-
-    # 3. Stability Score - using decline values
-    def generate_perturbation(features):
-        """Generate small random perturbations of features"""
-        perturbed = features.copy()
-        for feature, value in features.items():
-            if feature_types[feature] == "continuous":
-                min_val, max_val = feature_ranges[feature]
-                range_size = max_val - min_val
-                perturbation = np.random.uniform(
-                    -gamma * range_size, gamma * range_size
-                )
-                perturbed[feature] = np.clip(value + perturbation, min_val, max_val)
-            # For categorical features, we don't apply perturbations
-        return perturbed
-
-    # Generate perturbed versions and their decline values
-    # perturbed_declines = []
-    # for _ in range(n_perturbations):
-    #     perturbed_features = generate_perturbation(best_setting)
-    #     # Get trajectory for perturbed features through original model inference
-    #     perturbed_trajectory = dataset._tumor_volume_2(
-    #         time_points,
-    #         perturbed_features.values(),
-    #     )
-    #     perturbed_declines.append(perturbed_trajectory[-1] - perturbed_trajectory[0])
-
-    # S_score = np.std(perturbed_declines) / np.mean(perturbed_declines)
+    print(f"Best Settings Trajectory Metrics:")
+    print(f"Minimum y value: {min_y:.2f}")
+    print(f"Average y value: {avg_y:.2f}")
+    print(f"Decline in y: {decline:.2f}")
 
     return {
-        "prediction_error": E_pred,
-        "relative_improvement": R_imp,
-        # "stability_score": S_score,
-        "closest_example": closest_example,
-        "closest_idx": closest_idx,
-        "normalized_distance": min_distance,
-        "test_indices": test_indices,
+        "min_y": float(min_y),
+        "avg_y": float(avg_y),
+        "decline": float(decline),
+        **summary_dict,
     }
 
 
@@ -174,15 +139,11 @@ def tts_inference(
     litmodel,
     dataset,
     feature_combinations,
-    n_points=100,
     y_normalizer=None,
     column_transformer=None,
     return_transition_points=False,
 ):
-    """
-    [Previous docstring remains the same]
-    """
-
+    n_points = len(dataset.ys[0])
     # Convert input to DataFrame if it's a list of dictionaries
     if isinstance(feature_combinations, list):
         feature_combinations = pd.DataFrame(feature_combinations)
@@ -215,6 +176,7 @@ def tts_inference(
     trajectories = []
     transition_points_list = []
 
+    print("Forecasting trajectories...")
     for i in range(len(transformed_features)):
         # Get trajectory
         trajectory = litmodel.model.forecast_trajectory(transformed_features[i], t)
@@ -255,90 +217,43 @@ def tts_inference(
     return result
 
 
-def get_feature_combinations(
-    feature_types,
-    feature_ranges,
-    constant_features,
-    n_subset=100,
-):
-    # Separate varying and constant features
-    varying_features = {
-        k: v for k, v in feature_ranges.items() if k not in constant_features
-    }
-
-    # Create feature points dictionary
-    feature_points = {}
-    for feature, range_val in varying_features.items():
-        if feature_types[feature] == "continuous":
-            feature_points[feature] = np.linspace(range_val[0], range_val[1], n_subset)
-        else:  # categorical or binary
-            feature_points[feature] = range_val
-
-    # Generate all combinations using itertools.product
-    feature_names = list(feature_points.keys())
-    combinations = product(*[feature_points[f] for f in feature_names])
-
-    # Create settings list
-    feature_combinations = []
-    for combo in combinations:
-        setting = constant_features.copy()  # Start with constant features
-        setting.update(dict(zip(feature_names, combo)))  # Add varying features
-        feature_combinations.append(setting)
-
-    # Print summary
-    print(f"\nAnalysis Summary:")
-    print(f"Number of combinations: {len(feature_combinations)}")
-    print("\nConstant features:")
-    for k, v in constant_features.items():
-        print(f"  {k}: {v}")
-    print("\nVarying features:")
-    for k in varying_features.keys():
-        if feature_types[k] == "continuous":
-            print(
-                f"  {k}: {n_subset} points from {feature_ranges[k][0]} to {feature_ranges[k][1]}"
-            )
-        else:
-            print(f"  {k}: {len(feature_ranges[k])} categories")
-
-    # Example settings
-    print("\nExample settings:")
-    for i, setting in enumerate(feature_combinations[:3]):
-        print(f"\nSetting {i+1}:")
-        for k, v in setting.items():
-            print(f"  {k}: {v}")
-
-    summary_dict = {
-        "n_combinations": len(feature_combinations),
-        "constant_features": constant_features,
-        "varying_features": varying_features,
-        "feature_ranges": feature_ranges,
-        "feature_types": feature_types,
-    }
-
-    return feature_combinations, summary_dict
-
-
 def run_inference(
     dataset,
     litmodel,
     column_transformer,
     y_normalizer,
     constant_features,
+    result_dir,
     splits: list,
     n_subset=10,
     seed=0,
+    packing_type="static",
+    analyze_lipschitz=False,
+    epsilon=0.01,
 ):
     # Get feature information
     feature_ranges = dataset.get_feature_ranges()
     feature_types = dataset.get_feature_types()
 
     # Get feature combinations
-    feature_combinations, summary_dict = get_feature_combinations(
-        feature_ranges=feature_ranges,
-        feature_types=feature_types,
-        constant_features=constant_features,
-        n_subset=n_subset,
-    )
+    if packing_type == "static":
+        feature_combinations, summary_dict = get_feature_combinations(
+            feature_ranges=feature_ranges,
+            feature_types=feature_types,
+            constant_features=constant_features,
+            n_subset=n_subset,
+            epsilon=epsilon,
+        )
+    elif packing_type == "covering":
+        feature_combinations, summary_dict = get_feature_combinations_l2(
+            feature_ranges=feature_ranges,
+            feature_types=feature_types,
+            constant_features=constant_features,
+            n_subset=n_subset,
+            epsilon=epsilon,
+        )
+    else:
+        raise ValueError(f"Unknown packing type: {packing_type}")
 
     results = tts_inference(
         litmodel=litmodel,
@@ -353,105 +268,60 @@ def run_inference(
     time_points = results["t"]
     trajectories = results["trajectories"]
 
-    declines = trajectories[:, -1] - trajectories[:, 0]  # End point minus start point
+    L_estimate = {}
+    # not on every run
+    if analyze_lipschitz:
+        L_estimate = estimate_lipschitz_constant(
+            dataset=dataset,
+            feature_ranges=feature_ranges,
+            feature_types=feature_types,
+        )
+        L_estimate = {"L_estimate_max": L_estimate[0], "L_estimate_mean": L_estimate[1]}
 
-    # Find index of trajectory with least decline
-    best_idx = np.argmin(declines)
-
-    # Print the feature setting with least decline
-    # Print the feature setting with least decline
-    print("\nFeature setting with least decline:")
-    print(f"Total change in y: {declines[best_idx]:.2f}")
-    print("Feature values (value [range]):")
-    best_setting = feature_combinations[best_idx]
-
-    # First print constant features with their values
-    print("\nConstant features:")
-    for key, value in constant_features.items():
-        print(f"  {key}: {value}")
-
-    # Then print varying features with their ranges
-    print("\nVarying features:")
-    for key, value in best_setting.items():
-        if key not in constant_features:  # Only print varying features
-            if feature_types[key] == "continuous":
-                range_val = feature_ranges[key]
-                print(
-                    f"  {key}: {value:.2f} [range: {range_val[0]:.2f} to {range_val[1]:.2f}]"
-                )
-            else:  # categorical or binary
-                range_val = feature_ranges[key]
-                print(
-                    f"  {key}: {value} [possible values: {', '.join(map(str, range_val))}]"
-                )
-
-    # Optionally highlight this trajectory in the plot
-    plt.figure(figsize=(12, 8))
-    # Plot all trajectories in light gray
-    for trajectory in results["trajectories"]:
-        plt.plot(time_points, trajectory, alpha=0.1, color="gray")
-    # Plot the best trajectory in blue
-    plt.plot(
-        time_points, trajectories[best_idx], "b-", linewidth=2, label="Least decline"
-    )
-    plt.xlabel("Time")
-    plt.ylabel("Value")
-    plt.title(
-        f"Trajectories with {constant_features} \n(n={len(feature_combinations)})"
-    )
-    plt.legend()
-    plt.grid(True)
-
-    # Save the figure
-    filename = os.path.join(
-        "/dataNAS/people/sostm/TIMEVIEW/plots",
-        f"trajectories{constant_features}.png",
-    )
-    plt.savefig(filename, dpi=300, bbox_inches="tight")
-    plt.close()
-
-    print(f"\nFigure saved as: {filename}")
     evaluation_results = evaluate_model_predictions(
-        settings=feature_combinations,
         dataset=dataset,
         feature_types=feature_types,
         feature_ranges=feature_ranges,
         trajectories=trajectories,
         time_points=time_points,
+        feature_combinations=feature_combinations,
         train_size=splits[0],
         val_size=splits[1],
         seed=seed,
+        result_dir=result_dir,
+        constant_features=constant_features,
     )
 
-    # Print evaluation metrics
     print("\nEvaluation Metrics:")
-    print(f"Prediction Error: {evaluation_results['prediction_error']:.4f}")
-    print(f"Relative Improvement: {evaluation_results['relative_improvement']:.2f}%")
-    # print(f"Stability Score: {evaluation_results['stability_score']:.4f}")
-    print(
-        f"Distance to closest example: {evaluation_results['normalized_distance']:.4f}"
-    )
+    print(f"Minimum y value: {evaluation_results['min_y']:.4f}")
+    print(f"Average y value: {evaluation_results['avg_y']:.4f}")
+    print(f"Decline in y: {evaluation_results['decline']:.4f}")
+
+    return {**L_estimate, **summary_dict, **evaluation_results}
 
 
-if __name__ == "__main__":
-    # Your existing setup code
-    dataset_name = "flchain_1000"
-    # dataset_name = "synthetic_tumor_wilkerson_1"
-    # constant_features = {"age": 75.0, "initial_tumor_volume": 0.10}
-    model_name = "TTS"
-    constant_features = {"age": 75.0, "sex": "F"}
-    root = "/dataNAS/people/sostm/TIMEVIEW/experiments"
-    results_dir = f"{root}/benchmarks"
-    summary_filename = f"{root}/benchmarks/summary.json"
-    dataset_description_path = f"{root}/dataset_descriptions"
-
+def get_best_feature_combination(
+    dataset_name,
+    model_name,
+    root,
+    result_dir,
+    summary_filename,
+    constant_features,
+    n_subset,
+    epsilon,
+    packing_type,
+    dataset_description_path,
+    analyze_lipschitz=False,
+    bayesian_optimization=False,
+):
+    #### inherited start ####
     create_benchmark_datasets_if_not_exist(
-        dataset_description_path=f"{root}/dataset_descriptions"
+        dataset_description_path=dataset_description_path
     )
     results = find_results(
         dataset_name,
         model_name,
-        results_dir=results_dir,
+        results_dir=result_dir,
         summary_filename=summary_filename,
     )
 
@@ -464,25 +334,35 @@ if __name__ == "__main__":
 
     timestamp = results[-1]
 
-    spilt_sizes, seed = get_splits_from_summary(
-        timestamp, results_dir, summary_filename
-    )
+    spilt_sizes, seed = get_splits_from_summary(timestamp, result_dir, summary_filename)
+
     litmodel = load_model(
         timestamp, seed=661058651, benchmarks_folder=f"{root}/benchmarks"
     )
-    dataset = load_dataset(
-        dataset_name,
-        dataset_description_path=f"{root}/dataset_descriptions",
-        data_folder=f"{root}/data",
-    )
+    try:
+        dataset = load_dataset(
+            dataset_name,
+            dataset_description_path=f"{root}/dataset_descriptions",
+            data_folder=f"{root}/data",
+        )
+    except:
+        dataset = load_dataset(
+            dataset_name,
+            dataset_description_path=f"{root}/dataset_descriptions",
+            # data_folder=f"{root}/data",
+        )
     column_transformer = load_column_transformer(
         timestamp, benchmarks_dir=f"{root}/benchmarks"
     )
     y_normalizer = YNormalizer.load_from_benchmark(
         timestamp, model_name, benchmark_dir=f"{root}/benchmarks"
     )
+    #### inherited end ####
+    time = datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
+    result_dir = f"{root}/results/run_{timestamp}_time_{time}"
+    os.makedirs(result_dir, exist_ok=True)
 
-    run_inference(
+    summary_dict = run_inference(
         litmodel=litmodel,
         dataset=dataset,
         y_normalizer=y_normalizer,
@@ -490,4 +370,28 @@ if __name__ == "__main__":
         constant_features=constant_features,
         splits=spilt_sizes,
         seed=seed,
+        n_subset=n_subset,
+        result_dir=result_dir,
+        packing_type=packing_type,
+        analyze_lipschitz=analyze_lipschitz,
+        epsilon=epsilon,
     )
+
+    # save summary dict
+    summary_dict["timestamp"] = timestamp
+    summary_dict["model_name"] = model_name
+    summary_dict["dataset_name"] = dataset_name
+    summary_dict["seed"] = seed
+    summary_dict["spilt_sizes"] = spilt_sizes
+
+    with open(f"{result_dir}/summary.json", "w") as f:
+        json.dump(
+            summary_dict,
+            f,
+            indent=4,
+        )
+    return summary_dict
+
+
+if __name__ == "__main__":
+    pass
