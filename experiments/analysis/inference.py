@@ -2,22 +2,17 @@
 # %matplotlib inline
 import matplotlib.pyplot as plt
 import sys
-import np
 import ipdb
 
 sys.path.append("../../")
 from experiments.benchmark import generate_indices
 from lipschitz import estimate_lipschitz_constant
-import numpy as np
-import pandas as pd
 import matplotlib.pyplot as plt
 import os
-from itertools import product
 import numpy as np
 import pandas as pd
+from typing import Dict
 from timeview.basis import BSplineBasis
-import os
-import json
 from experiments.datasets import load_dataset
 from experiments.benchmark import (
     load_column_transformer,
@@ -33,7 +28,112 @@ from experiments.analysis.inference_construct_grid import (
     get_feature_combinations_l2,
     get_feature_combinations,
 )
-from experiments.analysis.inference_utils import get_splits_from_summary
+from experiments.analysis.inference_utils import (
+    get_splits_from_summary,
+    get_base_features,
+    mute_prints,
+    normalize_feature_to_np,
+)
+import random
+
+
+def run_single_iteration(
+    iteration_seed: int,
+    dataset_name: str,
+    dataset_features,
+    epsilon: float,
+    n_subset_iter,
+    mute,
+    model_name,
+    result_dir,
+    summary_filename,
+    dataset_description_path,
+    packing_type,
+    root,
+) -> Dict:
+    # Set different seeds for each iteration
+    random.seed(iteration_seed)
+    np.random.seed(iteration_seed)
+
+    # Generate random feature states based on dataset
+    base_features = get_base_features(dataset_name, dataset_features)
+
+    feature_order = list(base_features.keys())
+    random.shuffle(feature_order)
+
+    feature_states = []
+    for i in range(1, len(feature_order) + 1):
+        selected_featurnes = feature_order[:i]
+        state = {k: base_features[k] for k in selected_featurnes}
+        feature_states.append(state)
+
+    feature_states = list(reversed(feature_states))
+
+    convergence_data = {
+        "dimensions": [],
+        "combinations_needed": [],
+        "min_y_achieved": [],
+    }
+
+    with mute_prints(should_mute=mute):  # Mute all prints within this function
+        for features in feature_states:
+            state_results = []
+            for n_subset in range(1, n_subset_iter):
+                result = get_best_feature_combination(
+                    dataset_name=dataset_name,
+                    constant_features=features,
+                    model_name=model_name,
+                    result_dir=result_dir,
+                    summary_filename=summary_filename,
+                    dataset_description_path=dataset_description_path,
+                    n_subset=n_subset,
+                    epsilon=epsilon,
+                    packing_type=packing_type,
+                    root=root,
+                )
+                result["n_subset"] = n_subset
+                state_results.append(result)
+
+            # Find convergence point
+            converged_result = None
+            for i, current in enumerate(state_results):
+                if current["best_varying_features"].keys() == 0:
+                    break
+                if all(
+                    np.sqrt(
+                        np.sum(
+                            (
+                                normalize_feature_to_np(
+                                    current["best_varying_features"]
+                                )
+                                - normalize_feature_to_np(
+                                    future["best_varying_features"]
+                                )
+                            )
+                            ** 2
+                        )
+                    )
+                    <= epsilon
+                    for future in state_results[i + 1 :]
+                ):
+                    converged_result = current
+                    break
+
+            if converged_result is None:
+                # If no convergence found, use the last result
+                Warning(
+                    f"No convergence found for feature set {features}. Using the last result."
+                )
+                converged_result = state_results[-1]
+
+            # Store convergence data for this feature set
+            convergence_data["dimensions"].append(len(features))
+            convergence_data["combinations_needed"].append(
+                converged_result["n_combinations"]
+            )
+            convergence_data["min_y_achieved"].append(converged_result["min_y"])
+
+        return convergence_data
 
 
 def evaluate_model_predictions(
